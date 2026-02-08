@@ -1,15 +1,11 @@
-numpy
-pandas
-matplotlib
-seaborn
-scikit-learn
-tqdm
-wfdb
-requests
-torch>=2.0
-torchvision
-fastai
-notebook
-ipykernel
-jupyterlab
+## Dependencies
 
+| Category | Packages |
+| :-- | :-- |
+| Core Scientific | numpy, pandas, scipy |
+| Deep Learning | torch, torchvision, torchaudio |
+| Machine Learning | scikit-learn, tqdm |
+| Biomedical (ECG) | wfdb |
+| Visualization | matplotlib, seaborn |
+| Experiment Tracking | wandb |
+| Notebooks | jupyter, ipykernel |

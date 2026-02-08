@@ -1,6 +1,6 @@
 # Hybrid CNN–Transformer ECG Classification
 
-This repository contains the implementation for my thesis:
+This repository contains multiple deep learning models developed and tested on the [PTB-XL ECG dataset](https://physionet.org/content/ptb-xl/1.0.1/). These models include CNNs, Transformer architectures, ResNet variants, LSTMs, and hybrids, designed to classify ECG signals based on diagnostic codes.
 
 **Hybrid CNN–Transformer Models for Multi-Label ECG Classification with Interpretability**
 
