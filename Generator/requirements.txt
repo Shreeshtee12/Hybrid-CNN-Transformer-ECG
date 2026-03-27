@@ -1,0 +1,11 @@
+## Dependencies
+
+| Category | Packages |
+| :-- | :-- |
+| Core Scientific | numpy, pandas, scipy |
+| Deep Learning | torch, torchvision, torchaudio |
+| Machine Learning | scikit-learn, tqdm |
+| Biomedical (ECG) | wfdb |
+| Visualization | matplotlib, seaborn |
+| Experiment Tracking | wandb |
+| Notebooks | jupyter, ipykernel |

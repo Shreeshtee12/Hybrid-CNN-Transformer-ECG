@@ -1,0 +1,45 @@
+{
+  "os":  "Linux-5.14.0-427.102.1.el9_4.x86_64-x86_64-with-glibc2.34",
+  "python":  "CPython 3.11.11",
+  "startedAt":  "2026-03-25T22:40:22.808925Z",
+  "program":  "/users/PLS0150/shreeshtee/Hybrid-CNN-Transformer-ECG/notebooks/individual_notebooks/CNN_Transformer_Hybrid.ipynb",
+  "codePath":  "notebooks/individual_notebooks/CNN_Transformer_Hybrid.ipynb",
+  "git":  {
+    "remote":  "https://github.com/Shreeshtee12/Hybrid-CNN-Transformer-ECG.git",
+    "commit":  "d5014a81f1a38a8efd5425dbe4f2507cdf4954ba"
+  },
+  "email":  "sdhakal13@student.ysu.edu",
+  "root":  "/users/PLS0150/shreeshtee/Hybrid-CNN-Transformer-ECG/notebooks/individual_notebooks",
+  "host":  "p0247.ten.osc.edu",
+  "executable":  "/users/PLS0150/shreeshtee/.conda/envs/acorn/bin/python",
+  "codePathLocal":  "CNN_Transformer_Hybrid.ipynb",
+  "cpu_count":  40,
+  "cpu_count_logical":  40,
+  "gpu":  "Tesla V100-PCIE-16GB",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "204010946560",
+      "used":  "38184878080"
+    }
+  },
+  "memory":  {
+    "total":  "404292849664"
+  },
+  "cpu":  {
+    "count":  40,
+    "countLogical":  40
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "Tesla V100-PCIE-16GB",
+      "memoryTotal":  "17179869184",
+      "cudaCores":  5120,
+      "architecture":  "Volta"
+    }
+  ],
+  "slurm":  {
+    "job_id":  "45985201"
+  },
+  "cudaVersion":  "13.0"
+}
