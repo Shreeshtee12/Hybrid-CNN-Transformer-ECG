@@ -24,7 +24,7 @@ from torch.serialization import add_safe_globals
 import wfdb
 from torch.utils.data import DataLoader
 from sklearn.preprocessing import MultiLabelBinarizer
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.metrics import (
     classification_report,
     roc_curve,
@@ -39,6 +39,8 @@ from torchmetrics.functional.classification import multilabel_accuracy as tm_mul
 
 from models.components.lit_generic import LitGenericModel
 from models.torch_models.model_selector import get_model
+
+import config
 
 # Allowlist optimizer classes that may appear inside Lightning checkpoints when loading with weights_only
 add_safe_globals([torch.optim.AdamW])
@@ -83,7 +85,7 @@ def pick_checkpoint(args) -> str:
     """Return a checkpoint path from args.checkpoint or newest in args.checkpoint_dir."""
     if args.checkpoint:
         return args.checkpoint
-    ckpt_dir = args.checkpoint_dir or "lightning_logs/checkpoints"
+    ckpt_dir = args.checkpoint_dir or str(config.LIGHTNING_LOGS_DIR / "checkpoints")
     candidates = sorted(glob.glob(os.path.join(ckpt_dir, "*.ckpt")))
     if not candidates:
         raise FileNotFoundError(f"No checkpoints found in: {ckpt_dir}")
@@ -157,9 +159,17 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--sr", type=int, default=500, choices=[100, 500])
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Must match the --seed used in train_lightning.py so the same "
+                             "patient-grouped split is reproduced here.")
     parser.add_argument("--threshold", type=float, default=0.5, help="Decision threshold for binarizing probabilities.")
-    parser.add_argument("--output-dir", type=str, default="lightning_logs/metrics", help="Base directory for eval artifacts.")
+    parser.add_argument("--output-dir", type=str, default=str(config.LIGHTNING_LOGS_DIR / "metrics"), help="Base directory for eval artifacts.")
     args = parser.parse_args()
+
+    # seq-len is fully determined by sampling rate -- derive it automatically,
+    # matching train_lightning.py, instead of relying on --seq-len being passed
+    # correctly by hand every time.
+    args.seq_len = 5000 if args.sr == 500 else 1000
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -179,9 +189,10 @@ def main():
 
     # ---------- Label setup ----------
     if ckpt_num_classes == len(TARGET_CLASSES):
-        # 8-class evaluation
-        df["scp_filtered"] = df["diagnostic_superclass"].apply(
-            lambda keys: [k for k in keys if k in TARGET_CLASSES]
+        # 8-class evaluation. Confidence >= 50 rule, matching train_lightning.py
+        # and the notebook that actually produced the thesis's reported results.
+        df["scp_filtered"] = df["scp_codes"].apply(
+            lambda codes: [k for k, conf in codes.items() if k in TARGET_CLASSES and conf >= 50]
         )
         df = df[df["scp_filtered"].map(len) > 0].reset_index(drop=True)
         mlb = MultiLabelBinarizer(classes=TARGET_CLASSES)
@@ -190,7 +201,11 @@ def main():
         target_names = TARGET_CLASSES
         target_idxs = None  # not needed
     else:
-        # Full label space (project to TARGET_CLASSES if present)
+        # Full label space (project to TARGET_CLASSES if present).
+        # NOTE: this legacy fallback path does not apply the confidence>=50 rule
+        # (it's not used by the current 8-class hybrid model, only by older/
+        # differently-sized checkpoints). Flagging so it isn't assumed consistent
+        # with the 8-class branch above if this path is ever relied on again.
         mlb = MultiLabelBinarizer()
         y_full = mlb.fit_transform(all_keys)
         present_targets = [c for c in TARGET_CLASSES if c in mlb.classes_]
@@ -201,11 +216,26 @@ def main():
         target_names = present_targets
         print(f"[eval] Using full label space with projection to present targets: {target_names}")
 
-    # ---------- Split ----------
-    records = df["filename_hr"].str.replace(".hea", "", regex=False).values
-    train_rec, val_rec, y_train, y_val = train_test_split(
-        records, y, test_size=0.2, random_state=42, stratify=None
-    )
+    # ---------- Split (loaded from the ONE shared split, matching train_lightning.py) ----------
+    # Run `python data_split.py` once before evaluating any checkpoint.
+    # filename_lr (100Hz) matches the notebook's actual pipeline, NOT filename_hr (500Hz).
+    records = df["filename_lr"].str.replace(".hea", "", regex=False).values
+
+    try:
+        from data_split import load_split
+        split = load_split()
+        train_mask = np.isin(records, split["train_records"])
+        val_mask = np.isin(records, split["val_records"])
+        train_rec, y_train = records[train_mask], y[train_mask]
+        val_rec, y_val = records[val_mask], y[val_mask]
+        print(f"[eval] Loaded shared split: {len(train_rec)} train / {len(val_rec)} val records "
+              f"(seed={split['seed']})")
+    except FileNotFoundError:
+        raise SystemExit(
+            "No shared split found. Run `python data_split.py` once before evaluating "
+            "any checkpoint, so evaluation uses the exact same split training used."
+        )
+
     train_ds = PTBXL_Dataset(train_rec, y_train, args.signal_path, sr=args.sr)
     val_ds   = PTBXL_Dataset(val_rec,  y_val,   args.signal_path, sr=args.sr)
 

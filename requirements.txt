@@ -4,7 +4,7 @@
 | :-- | :-- |
 | Core Scientific | numpy, pandas, scipy |
 | Deep Learning | torch, torchvision, torchaudio |
-| Machine Learning | scikit-learn, tqdm |
+| Machine Learning | scikit-learn, tqdm, iterstrat |
 | Biomedical (ECG) | wfdb |
 | Visualization | matplotlib, seaborn |
 | Experiment Tracking | wandb |

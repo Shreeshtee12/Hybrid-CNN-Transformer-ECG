@@ -1,191 +1,175 @@
-<<<<<<< HEAD
-# models/cnn_transformer.py
+"""
+models/torch_models/cnn_transformer.py
+
+This is the REAL hybrid architecture used to produce the thesis's reported
+results (97% accuracy, matching the Methodology chapter's description:
+four residual CNN blocks [64,128,256,512], six Transformer encoder layers,
+8-head attention, sinusoidal positional encoding).
+
+Ported directly from notebooks/archive/individual_notebooks/CNN_Transformer_Hybrid.ipynb
+(the OptimizedHybrid class), NOT from an earlier, smaller, unrelated model that
+previously lived in this file under the same name.
+
+IMPORTANT: this model was trained/evaluated at 100Hz (1000 samples per 10s
+record, using filename_lr), not the 500Hz (5000-sample, filename_hr) signals
+used elsewhere in src/. Pass --seq-len 1000 and --sr 100 when training this
+model so the data pipeline matches what this architecture expects.
+"""
 
 import torch
 import torch.nn as nn
+import numpy as np
 
 
-class ECG_Transformer(nn.Module):
-    def __init__(self, seq_len=5000, num_features=12, d_model=32, nhead=2, num_layers=2, num_classes=8):
-        super(ECG_Transformer, self).__init__()
+class ResidualCNNBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=7, padding=3)
+        self.bn1   = nn.BatchNorm1d(out_channels)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=5, padding=2)
+        self.bn2   = nn.BatchNorm1d(out_channels)
+        self.relu  = nn.ReLU(inplace=True)
+        self.pool  = nn.MaxPool1d(kernel_size=2)
 
-        self.cnn = nn.Sequential(
-            nn.Conv1d(in_channels=num_features, out_channels=32, kernel_size=7, padding=3),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(in_channels=32, out_channels=d_model, kernel_size=5, padding=2),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2)
+        self.shortcut = (
+            nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm1d(out_channels),
+            ) if in_channels != out_channels else nn.Identity()
         )
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(d_model, num_classes)
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)  # (B, C, T) → (B, Channels, SeqLen)
-        x = self.cnn(x)  # (B, d_model, reduced_seq_len)
-        x = x.permute(0, 2, 1)  # (B, SeqLen, d_model)
-        x = self.transformer_encoder(x)
-        x = x.permute(0, 2, 1)  # (B, d_model, SeqLen)
-        x = self.global_avg_pool(x).squeeze(-1)  # (B, d_model)
-        return self.fc(x)  # (B, num_classes)
+        identity = self.shortcut(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.relu(out + identity)
+        return self.pool(out)
 
 
-def build_model(input_shape, num_classes, d_model=32, nhead=2, num_layers=2, **kwargs):
-    """
-    Constructs a CNN + Transformer model.
-    Args:
-        input_shape (tuple): (channels, sequence_length)
-        num_classes (int): output class count
-        d_model (int): transformer dimension
-        nhead (int): number of attention heads
-        num_layers (int): transformer encoder layers
-    """
-    channels, seq_len = input_shape
-    return ECG_Transformer(seq_len=seq_len,
-                           num_features=channels,
-                           d_model=d_model,
-                           nhead=nhead,
-                           num_layers=num_layers,
-                           num_classes=num_classes)
-=======
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-class ConvStem1D(nn.Module):
-    """Aggressive but stable downsampling + morphology capture."""
-    def __init__(self, in_ch: int, hid: int, out_ch: int):
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding (Vaswani et al., 2017)."""
+    def __init__(self, d_model, max_len=200):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv1d(in_ch, hid, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm1d(hid),
-            nn.GELU(),
-            nn.Conv1d(hid, hid, kernel_size=5, stride=2, padding=2, bias=False),
-            nn.BatchNorm1d(hid),
-            nn.GELU(),
-            nn.Conv1d(hid, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm1d(out_ch),
-            nn.GELU(),
-        )  # overall /8 in time
-
-    def forward(self, x):  # x: (B, C, T)
-        return self.stem(x)  # (B, out_ch, T/8)
-
-
-class CNNTransformer(nn.Module):
-    def __init__(
-        self,
-        seq_len=5000,
-        num_features=12,
-        d_model=128,      
-        nhead=4,         
-        num_layers=4,     
-        num_classes=8,
-        stem_hidden=64,
-        dropout=0.1,
-        emb_dropout=0.1,
-        pool="avg",       # "avg" or "cls"
-    ):
-        super().__init__()
-
-        # --- 1) Conv stem with stride downsampling (/8) ---
-        self.stem = ConvStem1D(in_ch=num_features, hid=stem_hidden, out_ch=d_model)
-
-        # --- 2) 1x1 conv to ensure exact d_model alignment (no-op if already d_model) ---
-        self.proj = nn.Conv1d(d_model, d_model, kernel_size=1, bias=False)
-
-        # --- 3) Learnable positional embedding (created lazily per sequence length) ---
-        self.pos_emb = None
-        self.emb_dropout = nn.Dropout(emb_dropout)
-
-       
-        self.use_cls = (pool == "cls")
-        if self.use_cls:
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-            nn.init.normal_(self.cls_token, std=0.02)
-
-        # --- 4) Transformer encoder (norm_first is nicer for stability) ---
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # --- 5) Head ---
-        self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, num_classes)
-
-        # Init head
-        nn.init.trunc_normal_(self.head.weight, std=0.02)
-        nn.init.zeros_(self.head.bias)
-
-    def _pos_embed(self, x_tokens):
-        """Create/resize learnable pos emb to current length L."""
-        B, L, D = x_tokens.shape
-        if (self.pos_emb is None) or (self.pos_emb.shape[1] != L):
-            # fresh parameter sized to current token length
-            pe = torch.zeros(1, L, D, device=x_tokens.device)
-            nn.init.normal_(pe, std=0.01)
-            self.pos_emb = nn.Parameter(pe)
-        return x_tokens + self.pos_emb
+        pe       = torch.zeros(1, max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # Expect (B, C, T). If you feed (B, T, C) from elsewhere, permute before calling.
-        # --- conv stem ---
-        x = self.stem(x)           # (B, d_model, T')
-        x = self.proj(x)           # (B, d_model, T')
-        x = x.transpose(1, 2)      # (B, T', d_model) = tokens
+        return x + self.pe[:, :x.size(1), :]
 
-        # --- optional CLS token ---
-        if self.use_cls:
-            cls = self.cls_token.expand(x.size(0), -1, -1)  # (B, 1, D)
-            x = torch.cat([cls, x], dim=1)                  # (B, 1+T', D)
 
-        # --- learnable pos emb + dropout ---
-        x = self._pos_embed(x)
-        x = self.emb_dropout(x)
+class TransformerBlock(nn.Module):
+    """Pre-norm Transformer encoder block."""
+    def __init__(self, embed_dim, num_heads=8, mlp_ratio=4, dropout=0.2):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn  = nn.MultiheadAttention(embed_dim, num_heads,
+                                           dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp   = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
+            nn.Dropout(dropout),
+        )
 
-        # --- encoder ---
-        x = self.transformer_encoder(x)   # (B, L, D)
-
-        # --- pooling ---
-        if self.use_cls:
-            x = x[:, 0]                   # (B, D)
-        else:
-            x = x.mean(dim=1)             # global avg pool (B, D)
-
-        x = self.norm(x)
-        x = self.head(x)                  # (B, num_classes)
+    def forward(self, x):
+        attn_out, _ = self.attn(*([self.norm1(x)] * 3))
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
-def build_model(input_shape, num_classes, d_model=128, nhead=4, num_layers=4, **kwargs):
+class OptimizedHybrid(nn.Module):
     """
-    Constructs a stronger CNN + Transformer model.
-    input_shape: (channels, sequence_length)
+    Hybrid CNN-Transformer for Multi-Label ECG Classification.
+    Input:  (B, 12, seq_len)
+    Output: (B, num_classes) — raw logits
+    """
+    def __init__(self, input_channels=12, seq_len=1000, num_classes=8,
+                 cnn_channels=[64, 128, 256, 512],
+                 transformer_layers=6, num_heads=8, dropout=0.2):
+        super().__init__()
+
+        # CNN Frontend -- four residual blocks, each halves the sequence length
+        self.cnn1 = ResidualCNNBlock(input_channels,  cnn_channels[0])
+        self.cnn2 = ResidualCNNBlock(cnn_channels[0], cnn_channels[1])
+        self.cnn3 = ResidualCNNBlock(cnn_channels[1], cnn_channels[2])
+        self.cnn4 = ResidualCNNBlock(cnn_channels[2], cnn_channels[3])
+        # e.g. 1000 -> 500 -> 250 -> 125 -> 62 time steps at seq_len=1000
+
+        embed_dim = cnn_channels[3]
+        # NOTE: dynamically computed from seq_len (four halvings), rather than
+        # the notebook's hardcoded max_len=62, so this generalizes correctly
+        # if seq_len is ever something other than 1000.
+        pooled_len = seq_len
+        for _ in range(4):
+            pooled_len = pooled_len // 2
+        self.pos_encoding = PositionalEncoding(embed_dim, max_len=pooled_len)
+
+        # Transformer Backend
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, mlp_ratio=4, dropout=dropout)
+            for _ in range(transformer_layers)
+        ])
+
+        # Classification Head
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 2, num_classes),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm)):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # Expects (B, C, T). If fed (B, T, C), permute before calling.
+        x = self.cnn1(x)
+        x = self.cnn2(x)
+        x = self.cnn3(x)
+        x = self.cnn4(x)
+        x = x.transpose(1, 2)              # (B, T', embed_dim)
+        x = self.pos_encoding(x)
+        for block in self.transformer_blocks:
+            x = block(x)
+        x = self.norm(x)
+        x = x.mean(dim=1)                  # Global avg pool
+        return self.head(x)
+
+
+def build_model(input_shape, num_classes, cnn_channels=[64, 128, 256, 512],
+                 transformer_layers=6, num_heads=8, dropout=0.2, **kwargs):
+    """
+    Constructs the real Hybrid CNN-Transformer (matches thesis Methodology chapter).
+    Args:
+        input_shape (tuple): (channels, sequence_length)
+        num_classes (int): number of output classes
     """
     channels, seq_len = input_shape
-    return CNNTransformer(
+    return OptimizedHybrid(
+        input_channels=channels,
         seq_len=seq_len,
-        num_features=channels,
-        d_model=d_model,
-        nhead=nhead,
-        num_layers=num_layers,
         num_classes=num_classes,
-        **kwargs
+        cnn_channels=cnn_channels,
+        transformer_layers=transformer_layers,
+        num_heads=num_heads,
+        dropout=dropout,
     )
->>>>>>> upstream/master

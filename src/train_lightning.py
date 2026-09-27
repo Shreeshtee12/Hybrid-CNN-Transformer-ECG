@@ -17,6 +17,8 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Ea
 from pytorch_lightning.loggers import WandbLogger
 import wandb
 
+import config
+
 from models.components.lit_generic import LitGenericModel
 from models.torch_models.model_selector import get_model
 
@@ -79,7 +81,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train a model with PyTorch Lightning (W&B enabled)')
     parser.add_argument('--model', type=str, required=True, help='Model name (cnn_transformer, resnet1d, transformer, xlstm, xresnet1d)')
     parser.add_argument('--input-channels', type=int, default=12)
-    parser.add_argument('--seq-len', type=int, default=5000)
+    parser.add_argument('--seq-len', type=int, default=5000, help='Auto-derived from --sr; this flag is ignored (kept for backward compatibility).')
     parser.add_argument('--num-classes', type=int, default=8)  # overridden by mlb below
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--max-epochs', type=int, default=120)
@@ -105,11 +107,17 @@ def main():
     parser.add_argument('--num-workers', type=int, default=2, help='OSC suggests <=2 workers')
     args = parser.parse_args()
 
+    # seq-len is fully determined by sampling rate -- derive it automatically
+    # instead of relying on --seq-len being passed correctly by hand every time.
+    args.seq_len = 5000 if args.sr == 500 else 1000
+
     # Reproducibility
     pl.seed_everything(args.seed, workers=True)
 
-    # Ensure checkpoint dir exists
-    os.makedirs('lightning_logs/checkpoints', exist_ok=True)
+    # Ensure checkpoint dir exists -- tagged with model name so training two
+    # different architectures never overwrites/mixes up checkpoint files.
+    ckpt_dir = str(config.LIGHTNING_LOGS_DIR / "checkpoints" / args.model)
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     # Callbacks (best + last checkpoints; LR monitor; optional EarlyStopping)
     checkpoint_callback = ModelCheckpoint(
@@ -117,8 +125,8 @@ def main():
         save_top_k=1,
         save_last=True,
         mode="min",
-        dirpath="lightning_logs/checkpoints",
-        filename="epoch={epoch}-step={step}-val_loss={val_loss:.4f}",
+        dirpath=ckpt_dir,
+        filename=f"{args.model}" + "-epoch={epoch}-step={step}-val_loss={val_loss:.4f}",
         every_n_epochs=1,
     )
     # Additional best-by-accuracy checkpoint (pairs with val_acc logged by LitGenericModel)
@@ -126,8 +134,8 @@ def main():
         monitor="val_acc",
         save_top_k=1,
         mode="max",
-        dirpath="lightning_logs/checkpoints",
-        filename="epoch={epoch}-step={step}-val_acc={val_acc:.4f}",
+        dirpath=ckpt_dir,
+        filename=f"{args.model}" + "-epoch={epoch}-step={step}-val_acc={val_acc:.4f}",
         every_n_epochs=1,
     )
 
@@ -143,38 +151,43 @@ def main():
     if not args.no_early_stop:
         callbacks.append(early_stop)
 
-    
     # ~~~~~~~~~~~~~~~~~~~ Data prep (8 target classes) ~~~~~~~~~~~~~~~~~~~~~~~~~~
     
     TARGET_CLASSES = ['NORM', 'AFIB', 'PVC', 'LVH', 'IMI', 'ASMI', 'LAFB', 'IRBBB']
     df = pd.read_csv(args.csv_path)
     df['scp_codes'] = df['scp_codes'].apply(ast.literal_eval)
-    df['scp_keys'] = df['scp_codes'].apply(lambda x: list(x.keys()))
-    df['scp_filtered'] = df['scp_keys'].apply(lambda keys: [k for k in keys if k in TARGET_CLASSES])
+    # Confidence >= 50 rule, matching the notebook that actually produced the
+    # thesis's reported results -- a code present with low confidence does NOT
+    # count as a positive label here (this repo's OTHER pipeline ignored
+    # confidence entirely, which is a real difference in label quality).
+    df['scp_filtered'] = df['scp_codes'].apply(
+        lambda codes: [k for k, conf in codes.items() if k in TARGET_CLASSES and conf >= 50]
+    )
     df = df[df['scp_filtered'].map(len) > 0].reset_index(drop=True)
 
     mlb = MultiLabelBinarizer(classes=TARGET_CLASSES)
-    y = mlb.fit_transform(df['scp_filtered'])
-    records = df['filename_hr'].str.replace('.hea', '', regex=False).values
+    y_all = mlb.fit_transform(df['scp_filtered'])
+    # filename_lr (100Hz) matches the notebook's actual pipeline, NOT filename_hr (500Hz).
+    records_all = df['filename_lr'].str.replace('.hea', '', regex=False).values
 
-    
-    # ~~~~~~~~~~~~~~~~~ Patient-wise split (leakage-safe) ~~~~~~~~~~~~~~~~~~~~~
-    
-    if 'patient_id' in df.columns:
-        groups = df['patient_id'].values
-        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=args.seed)
-        train_idx, val_idx = next(gss.split(records, y, groups=groups))
-        train_rec, val_rec = records[train_idx], records[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
-    else:
-        try:
-            train_rec, val_rec, y_train, y_val = train_test_split(
-                records, y, test_size=0.2, random_state=args.seed, stratify=y
-            )
-        except ValueError:
-            train_rec, val_rec, y_train, y_val = train_test_split(
-                records, y, test_size=0.2, random_state=args.seed
-            )
+    # ~~~~~~~~~~~~~~~~~ Load the ONE shared split (built once by data_split.py) ~~~~~~~~~~~~~~~~~~~~~
+    # Every architecture reads the exact same split from disk now, instead of
+    # each training run recomputing its own GroupShuffleSplit. Run
+    # `python data_split.py` once before training any model.
+    try:
+        from data_split import load_split
+        split = load_split()
+        train_mask = np.isin(records_all, split['train_records'])
+        val_mask = np.isin(records_all, split['val_records'])
+        train_rec, y_train = records_all[train_mask], y_all[train_mask]
+        val_rec, y_val = records_all[val_mask], y_all[val_mask]
+        print(f"[train] Loaded shared split: {len(train_rec)} train / {len(val_rec)} val records "
+              f"(seed={split['seed']})")
+    except FileNotFoundError:
+        raise SystemExit(
+            "No shared split found. Run `python data_split.py` once before training "
+            "any model, so every architecture trains/evaluates on the identical split."
+        )
 
     train_ds = PTBXL_Dataset(train_rec, y_train, args.signal_path, sr=args.sr, training=True, augment=args.augment)
     val_ds = PTBXL_Dataset(val_rec, y_val, args.signal_path, sr=args.sr, training=False, augment=False)
@@ -238,7 +251,7 @@ def main():
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         logger=logger,
-        default_root_dir="lightning_logs",
+        default_root_dir=str(config.LIGHTNING_LOGS_DIR),
         deterministic=True,
         log_every_n_steps=10,
         gradient_clip_val=args.grad_clip,

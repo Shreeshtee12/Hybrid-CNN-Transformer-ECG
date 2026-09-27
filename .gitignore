@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# ---------------------------------------------------------------------
+# ECG project specific -- training artifacts, generated/regenerable data
+# ---------------------------------------------------------------------
+lightning_logs/
+wandb/
+checkpoints/
+splits/
+*.ckpt
+*.pth
+*.pt
+*.npy
+results/*.csv
