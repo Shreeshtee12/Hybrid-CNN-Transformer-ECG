@@ -260,13 +260,6 @@ def main():
     # Train
     trainer.fit(lit_model, train_loader, val_loader)
 
-    # Explicitly finish W&B run to push logs promptly
-    if args.wandb:
-        try:
-            wandb.finish()
-        except Exception:
-            pass
-
     # Optional: log best checkpoint as a W&B artifact
     if args.wandb and args.log_artifact and checkpoint_callback.best_model_path:
         art = wandb.Artifact(
@@ -280,6 +273,13 @@ def main():
         )
         art.add_file(checkpoint_callback.best_model_path)
         logger.experiment.log_artifact(art)
+
+    # Finish the W&B run AFTER any artifact upload (finishing first made log_artifact fail)
+    if args.wandb:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

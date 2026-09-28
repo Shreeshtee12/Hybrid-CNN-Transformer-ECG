@@ -44,6 +44,13 @@ def run_one_model(model_name: str, args) -> str:
     ]
     if args.augment:
         train_cmd.append("--augment")
+    if args.wandb:
+        train_cmd += ["--wandb", "--project", args.project,
+                      "--run-name", f"{model_name}-seed{args.seed}-ep{args.max_epochs}"]
+        if args.entity:
+            train_cmd += ["--entity", args.entity]
+        if args.log_artifact:
+            train_cmd.append("--log-artifact")
     subprocess.run(train_cmd, check=True)
 
     # Find the best val_loss checkpoint for this model (train_lightning.py now
@@ -120,6 +127,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--augment", action="store_true")
+    parser.add_argument("--wandb", action="store_true", help="Log each model's training to Weights & Biases")
+    parser.add_argument("--project", type=str, default="ptbxl-ecg", help="W&B project name")
+    parser.add_argument("--entity", type=str, default=None, help="W&B entity (user or team)")
+    parser.add_argument("--log-artifact", action="store_true",
+                        help="Also upload each best checkpoint to W&B (large; ~250MB for the hybrid)")
     parser.add_argument("--models", nargs="+", default=config.MODEL_NAMES,
                          help="Subset of models to run (default: all in config.MODEL_NAMES)")
     args = parser.parse_args()
