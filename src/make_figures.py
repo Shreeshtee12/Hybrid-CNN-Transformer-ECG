@@ -303,6 +303,42 @@ def main():
     attempt("roc_curves", lambda: (F.plot_roc(y_true, y_pred, TARGET_CLASSES, detected, out_dir / "roc_curves.png"), out_dir / "roc_curves.png")[-1])
     attempt("confusion", lambda: (F.plot_confusion_grid(y_true, y_pred, thr, TARGET_CLASSES, detected, out_dir / "confusion.pdf"), out_dir / "confusion.pdf")[-1])
 
+    # ---- Native W&B charts (built from the raw numbers, not uploaded images) ----
+    # ROC and confusion matrix are the two figure types W&B can draw itself, as
+    # interactive charts, given the raw data. Everything else below this point
+    # (Grad-CAM, SHAP, attention, best/worst, negative) is a custom visualization
+    # with no native W&B chart type -- those stay as uploaded images, which is
+    # the correct and only way to log a custom matplotlib figure to W&B.
+    if wandb_run is not None:
+        try:
+            wandb_run.log({
+                "native/roc_curves": wandb.plot.roc_curve(
+                    y_true, y_pred, labels=TARGET_CLASSES,
+                    classes_to_plot=list(range(len(TARGET_CLASSES))),
+                )
+            })
+            print("[figs]   ok: native roc_curves (wandb)")
+        except Exception as e:
+            print(f"[figs]   FAILED: native roc_curves (wandb): {e!r}")
+
+        # wandb's confusion_matrix expects single-label classification (one true
+        # class per sample). This is multi-label (8 independent yes/no decisions),
+        # so we log ONE native confusion matrix per class -- each is a valid,
+        # correct 2-class (absent/present) confusion matrix on its own.
+        for i, cname in enumerate(TARGET_CLASSES):
+            try:
+                yt_i = y_true[:, i]
+                yp_i = (y_pred[:, i] >= thr[i]).astype(int)
+                wandb_run.log({
+                    f"native/confusion_matrix/{cname}": wandb.plot.confusion_matrix(
+                        y_true=yt_i.tolist(), preds=yp_i.tolist(),
+                        class_names=[f"No {cname}", cname],
+                    )
+                })
+            except Exception as e:
+                print(f"[figs]   FAILED: native confusion_matrix {cname} (wandb): {e!r}")
+        print("[figs]   ok: native confusion matrices (wandb), one per class")
+
     # ---- capabilities ----
     target_layer = None if args.skip_gradcam else get_target_layer(model, detected)
     gradcam_ok = target_layer is not None
