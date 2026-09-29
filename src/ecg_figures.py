@@ -323,6 +323,91 @@ def plot_gradcam_panels_bc(all_cams, signal, mean_cam, class_name, save_path, fs
     return lead_imp
 
 
+def plot_gradcam_combined(all_cams, signal, mean_cam, class_name, save_path, fs=100):
+    """
+    ONE figure instead of two files: panel A (ECG + Grad-CAM overlay) on top,
+    spanning the full width, with panel B (per-lead importance) and panel C
+    (cross-sample heatmap) side by side underneath. Same drawing code as
+    plot_gradcam_panel_a / plot_gradcam_panels_bc, just laid out on one canvas
+    -- easier to scan when you have 5 models x 8 classes to look through.
+    Returns lead_imp, same as plot_gradcam_panels_bc.
+    """
+    lead = np.asarray(signal[0], dtype=float)
+    n = len(lead)
+    t = np.arange(n) / fs
+    cam_norm = _minmax(_resample(mean_cam, n))
+
+    n_lead_samples = signal.shape[1]
+    lead_imp = lead_importance_from_cam(_resample(mean_cam, n_lead_samples), signal)
+    order = np.argsort(lead_imp)
+    n_samples = len(all_cams)
+    cam_rows = np.array([
+        [seg.mean() for seg in np.array_split(_resample(c, n_lead_samples), 50)] for c in all_cams
+    ])
+
+    with plt.rc_context(_GC_RC):
+        fig = plt.figure(figsize=(14, 9.5), facecolor="white")
+        gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 0.85], hspace=0.4, wspace=0.20)
+
+        # ---- Panel A: ECG + Grad-CAM overlay, full width ----
+        ax_ecg = fig.add_subplot(gs[0, :])
+        ax_ecg.plot(t, lead, color=ECGCOLOR, linewidth=1.0, zorder=3, alpha=0.9)
+        ax_ecg.fill_between(t, lead.min() - 0.3, lead.min() - 0.3 + cam_norm * 0.5,
+                            alpha=0.35, color=ACCENT, zorder=2, label="Grad-CAM activation")
+        peaks, _ = find_peaks(cam_norm, height=0.4, distance=int(0.5 * fs))
+        for pk in peaks[:3]:
+            ax_ecg.axvline(t[pk], color=ACCENT, linewidth=1.0, alpha=0.6, linestyle="--", zorder=4)
+        ax_ecg.set_xlim(t[0], t[-1])
+        ax_ecg.set_ylim(lead.min() - 0.5, lead.max() + 0.3)
+        ax_ecg.set_xlabel("Time (s)", fontsize=13, labelpad=6)
+        ax_ecg.set_ylabel("Amplitude (mV)", fontsize=13, labelpad=6)
+        ax_ecg.tick_params(labelsize=12)
+        ax_ecg.set_title(f"A   Grad-CAM Explanation \u2014 {class_name} (Lead I)",
+                         fontsize=13, fontweight="bold", loc="left", pad=8)
+        ax_ecg.legend(fontsize=11, frameon=False, loc="upper right")
+        ax_ecg.grid(color=GRIDCOL, linewidth=0.5)
+
+        # ---- Panel B: per-lead importance ----
+        ax_bar = fig.add_subplot(gs[1, 0])
+        colors_bar = [ACCENT if lead_imp[i] > 0.6 else "#AAAAAA" for i in order]
+        bars = ax_bar.barh(range(12), lead_imp[order], color=colors_bar, height=0.55, edgecolor="none")
+        for bar, val in zip(bars, lead_imp[order]):
+            if val > 0.08:
+                ax_bar.text(val + 0.015, bar.get_y() + bar.get_height() / 2, f"{val:.2f}",
+                            va="center", fontsize=9, color="#444")
+        ax_bar.set_yticks(range(12))
+        ax_bar.set_yticklabels([LEAD_NAMES[i] for i in order], fontsize=10)
+        ax_bar.set_xlabel("Normalised Grad-CAM score", fontsize=10, labelpad=5)
+        ax_bar.tick_params(labelsize=10, left=False)
+        ax_bar.set_title(f"B   Per-lead importance \u2014 {class_name}",
+                         fontsize=11, fontweight="bold", loc="left", pad=6)
+        ax_bar.grid(axis="x", color=GRIDCOL, linewidth=0.5)
+        ax_bar.spines["left"].set_visible(False)
+        ax_bar.set_xlim(0, 1.45)
+        ax_bar.text(1.14, 11, f"\u2190 {LEAD_NAMES[order[-1]]}", fontsize=9,
+                    color=ACCENT, va="center", fontweight="bold")
+
+        # ---- Panel C: cross-sample activation heatmap ----
+        ax_heat = fig.add_subplot(gs[1, 1])
+        im = ax_heat.imshow(cam_rows, aspect="auto", cmap="Reds", vmin=0, vmax=1, interpolation="nearest")
+        step = max(1, n_samples // 10)
+        ax_heat.set_yticks(range(0, n_samples, step))
+        ax_heat.set_yticklabels([f"S{i + 1}" for i in range(0, n_samples, step)], fontsize=9)
+        ax_heat.set_xlabel("Time segment", fontsize=10, labelpad=5)
+        ax_heat.tick_params(labelsize=9)
+        ax_heat.set_title(f"C   Cross-sample activation \u2014 {class_name}",
+                          fontsize=11, fontweight="bold", loc="left", pad=6)
+        cb = plt.colorbar(im, ax=ax_heat, fraction=0.06, pad=0.05)
+        cb.set_label("Activation", fontsize=9)
+        cb.ax.tick_params(labelsize=8)
+
+        fig.suptitle(f"Grad-CAM Interpretability \u2014 {class_name}", fontsize=14,
+                    fontweight="bold", y=0.98, color=ECGCOLOR)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+    return lead_imp
+
+
 # =====================================================================
 # SHAP (notebook cell 36)
 # =====================================================================

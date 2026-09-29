@@ -82,14 +82,29 @@ class PTBXL_Dataset(torch.utils.data.Dataset):
 # ----------------------------- Utils -----------------------------
 
 def pick_checkpoint(args) -> str:
-    """Return a checkpoint path from args.checkpoint or newest in args.checkpoint_dir."""
+    """
+    Return a checkpoint path: args.checkpoint if given, else the LOWEST
+    val_loss checkpoint in args.checkpoint_dir, else last.ckpt.
+    This is the ONE place checkpoint selection happens -- run_all_models.py
+    and make_figures.py both call this instead of each re-implementing
+    their own picking logic, so a standalone `python eval.py` always
+    scores the same checkpoint run_all_models.py already picked.
+    """
     if args.checkpoint:
         return args.checkpoint
     ckpt_dir = args.checkpoint_dir or str(config.LIGHTNING_LOGS_DIR / "checkpoints")
-    candidates = sorted(glob.glob(os.path.join(ckpt_dir, "*.ckpt")))
-    if not candidates:
-        raise FileNotFoundError(f"No checkpoints found in: {ckpt_dir}")
-    return candidates[-1]
+    files = glob.glob(os.path.join(ckpt_dir, "*.ckpt"))
+    scored = []
+    for f in files:
+        m = re.findall(r"val_loss=(?:val_loss=)?([0-9]+\.[0-9]+)", os.path.basename(f))
+        if m:
+            scored.append((float(m[-1]), f))
+    if scored:
+        return min(scored)[1]
+    last = os.path.join(ckpt_dir, "last.ckpt")
+    if os.path.exists(last):
+        return last
+    raise FileNotFoundError(f"No checkpoints found in: {ckpt_dir}")
 
 
 def infer_num_classes_from_state(sd: dict) -> Optional[int]:

@@ -2,20 +2,8 @@
 run_all_models.py
 ==================
 Calls your EXISTING train_lightning.py and eval.py once per architecture,
-with identical arguments every time. This is what turns 5 separate,
-manually-run notebooks into one combined, reproducible run.
-
-It does NOT reimplement training -- it just runs your real scripts,
-back to back, for every model in MODEL_NAMES, so nothing can drift
-between architectures.
-
-Usage (run from the repo root, after `python data_split.py` has been run once):
-    python run_all_models.py \
-        --signal-path /path/to/records500 \
-        --csv-path /path/to/ptbxl_database.csv \
-        --max-epochs 120
-
-Requires config.py (for MODEL_NAMES) to be importable from this location.
+with identical arguments every time. Optionally also calls make_figures.py
+after each model's eval.
 """
 
 import argparse
@@ -30,7 +18,6 @@ import config
 
 
 def run_one_model(model_name: str, args) -> str:
-    """Trains one architecture, then evaluates its best checkpoint. Returns the eval output dir."""
     print(f"\n{'='*70}\nTRAINING: {model_name}\n{'='*70}")
     train_cmd = [
         sys.executable, "train_lightning.py",
@@ -53,16 +40,10 @@ def run_one_model(model_name: str, args) -> str:
             train_cmd.append("--log-artifact")
     subprocess.run(train_cmd, check=True)
 
-    # Find the best val_loss checkpoint for this model (train_lightning.py now
-    # saves to a model-specific folder after the checkpoint-collision fix).
     ckpt_dir = str(config.LIGHTNING_LOGS_DIR / "checkpoints" / model_name)
-    candidates = sorted(
-        f for f in glob.glob(os.path.join(ckpt_dir, "*.ckpt"))
-        if "val_loss" in f
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No val_loss checkpoint found for {model_name} in {ckpt_dir}")
-    best_ckpt = candidates[-1]
+    from eval import pick_checkpoint
+    class _A: checkpoint = None; checkpoint_dir = ckpt_dir
+    best_ckpt = pick_checkpoint(_A())
     print(f"[run_all] Using checkpoint: {best_ckpt}")
 
     print(f"\n{'='*70}\nEVALUATING: {model_name}\n{'='*70}")
@@ -78,10 +59,23 @@ def run_one_model(model_name: str, args) -> str:
     ]
     subprocess.run(eval_cmd, check=True)
 
-    # eval.py's sanitize_name() replaces any character outside [A-Za-z0-9_.-]
-    # with "-" when building its output folder name (so "=" in checkpoint
-    # filenames becomes "-"). Replicate that exact transformation here so we
-    # look in the same place eval.py actually saved to.
+    if args.figures:
+        print(f"\n{'='*70}\nFIGURES: {model_name}\n{'='*70}")
+        fig_cmd = [
+            sys.executable, "make_figures.py",
+            "--model", model_name,
+            "--checkpoint", best_ckpt,
+            "--signal-path", args.signal_path,
+            "--csv-path", args.csv_path,
+            "--sr", str(args.sr),
+        ]
+        if args.figure_kinds:
+            fig_cmd += ["--classes"] + args.figure_kinds
+        rc = subprocess.run(fig_cmd).returncode
+        if rc != 0:
+            print(f"[run_all] WARNING: make_figures.py failed for {model_name} (exit {rc}). "
+                  f"Training and evaluation are unaffected; re-run make_figures.py by hand.")
+
     import re
     ckpt_basename = os.path.splitext(os.path.basename(best_ckpt))[0]
     ckpt_basename = re.sub(r"[^A-Za-z0-9_.-]", "-", ckpt_basename)
@@ -90,7 +84,6 @@ def run_one_model(model_name: str, args) -> str:
 
 
 def build_comparison_table(eval_dirs: dict):
-    """Merges each model's overall_summary.csv (produced by eval.py) into one table."""
     rows = []
     for model_name, out_dir in eval_dirs.items():
         summary_path = os.path.join(out_dir, "overall_summary.csv")
@@ -118,22 +111,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--signal-path", required=True)
     parser.add_argument("--csv-path", required=True)
-    parser.add_argument("--sr", type=int, default=100, choices=[100, 500],
-                         help="100Hz matches the notebook that produced the thesis's reported "
-                              "results (filename_lr, confidence>=50 labels). Only use 500 if "
-                              "intentionally testing the older, different data pipeline.")
+    parser.add_argument("--sr", type=int, default=100, choices=[100, 500])
     parser.add_argument("--seed", type=int, default=config.SEED)
     parser.add_argument("--max-epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--augment", action="store_true")
-    parser.add_argument("--wandb", action="store_true", help="Log each model's training to Weights & Biases")
-    parser.add_argument("--project", type=str, default="ptbxl-ecg", help="W&B project name")
-    parser.add_argument("--entity", type=str, default=None, help="W&B entity (user or team)")
-    parser.add_argument("--log-artifact", action="store_true",
-                        help="Also upload each best checkpoint to W&B (large; ~250MB for the hybrid)")
-    parser.add_argument("--models", nargs="+", default=config.MODEL_NAMES,
-                         help="Subset of models to run (default: all in config.MODEL_NAMES)")
+    parser.add_argument("--figures", action="store_true")
+    parser.add_argument("--figure-kinds", nargs="+", default=None)
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--project", type=str, default="ptbxl-ecg")
+    parser.add_argument("--entity", type=str, default=None)
+    parser.add_argument("--log-artifact", action="store_true")
+    parser.add_argument("--models", nargs="+", default=config.MODEL_NAMES)
     args = parser.parse_args()
 
     eval_dirs = {}

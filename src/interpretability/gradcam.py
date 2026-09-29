@@ -52,11 +52,16 @@ def gradcam_1d(model, input_signal, target_class, device, target_layer=None):
     handle_fwd = target_layer.register_forward_hook(forward_hook)
     handle_bwd = target_layer.register_full_backward_hook(backward_hook)
 
-    output = model(input_signal)
-    score = output[:, target_class]
+    # cuDNN's RNN kernel cannot run backward() while the module is in eval()
+    # mode ("cudnn RNN backward can only be called in training mode").
+    # Disabling cuDNN for just this forward+backward falls back to a generic
+    # implementation that supports it. No-op for CNN-only models.
+    with torch.backends.cudnn.flags(enabled=False):
+        output = model(input_signal)
+        score = output[:, target_class]
 
-    model.zero_grad()
-    score.backward(torch.ones_like(score))
+        model.zero_grad()
+        score.backward(torch.ones_like(score))
 
     grads = gradients[0].detach().cpu().numpy()[0]   # (C, T')
     acts = activations[0].detach().cpu().numpy()[0]  # (C, T')

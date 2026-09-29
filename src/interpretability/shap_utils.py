@@ -32,7 +32,7 @@ def make_model_predict_fn(model, device, n_bins=50, signal_length=1000):
     """
     expand_factor = signal_length // n_bins
 
-    def model_predict(x):
+    def model_predict(x, _batch_size=32):
         x = np.array(x)
         x = x.reshape(x.shape[0], 12, n_bins)
         x = np.repeat(x, expand_factor, axis=2)
@@ -40,10 +40,18 @@ def make_model_predict_fn(model, device, n_bins=50, signal_length=1000):
             # handle signal_length not evenly divisible by n_bins
             pad = signal_length - x.shape[2]
             x = np.pad(x, ((0, 0), (0, 0), (0, pad)), mode="edge")
-        x_t = torch.tensor(x, dtype=torch.float32, device=device)
+        # Chunk into small batches: SHAP's KernelExplainer can pass hundreds of
+        # perturbed rows in one call, and an LSTM's memory use per sample (scanned
+        # over the full sequence) is far steeper than a CNN's -- passing them all
+        # at once is what caused a 21+ GiB allocation for xlstm even though the
+        # same code was fine for the CNN-based models.
+        all_preds = []
         with torch.no_grad():
-            preds = model(x_t).cpu().numpy()
-        return preds
+            for start in range(0, x.shape[0], _batch_size):
+                chunk = x[start:start + _batch_size]
+                x_t = torch.tensor(chunk, dtype=torch.float32, device=device)
+                all_preds.append(model(x_t).cpu().numpy())
+        return np.concatenate(all_preds, axis=0)
 
     return model_predict
 

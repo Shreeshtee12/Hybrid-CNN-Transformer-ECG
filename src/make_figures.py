@@ -58,7 +58,7 @@ import config
 import ecg_figures as F
 from data_split import load_split
 from eval import (
-    PTBXL_Dataset, TARGET_CLASSES,
+    PTBXL_Dataset, TARGET_CLASSES, pick_checkpoint,
     infer_num_classes_from_state, infer_model_name_from_state,
 )
 from gradcam import gradcam_1d, compute_mean_cam, resample_cam
@@ -71,22 +71,6 @@ from shap_utils import compute_shap_for_class
 # ---------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------
-def pick_best_val_loss_checkpoint(ckpt_dir):
-    """Checkpoint with the lowest val_loss in its filename; falls back to last.ckpt."""
-    files = glob.glob(os.path.join(ckpt_dir, "*.ckpt"))
-    scored = []
-    for f in files:
-        m = re.findall(r"val_loss=(?:val_loss=)?([0-9]+\.[0-9]+)", os.path.basename(f))
-        if m:
-            scored.append((float(m[-1]), f))
-    if scored:
-        return min(scored)[1]
-    last = os.path.join(ckpt_dir, "last.ckpt")
-    if os.path.exists(last):
-        return last
-    raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
-
-
 class OrientedForSHAP:
     """shap_utils feeds (B, C, T). PTBXL_Dataset / eval.py feed (B, T, C) into the
     Lightning wrapper. This bridges the two so models whose first layer is Linear
@@ -110,10 +94,11 @@ def gradcam_abs(model, signal, target_class, device, target_layer):
     hf = target_layer.register_forward_hook(lambda m, i, o: acts.append(o))
     hb = target_layer.register_full_backward_hook(lambda m, gi, go: grads.append(go[0]))
     try:
-        out = model(x)
-        score = out[:, target_class]
-        model.zero_grad()
-        score.backward(torch.ones_like(score))
+        with torch.backends.cudnn.flags(enabled=False):
+            out = model(x)
+            score = out[:, target_class]
+            model.zero_grad()
+            score.backward(torch.ones_like(score))
     finally:
         hf.remove()
         hb.remove()
@@ -190,8 +175,16 @@ def main():
                          "regression was singular). Raise further for the journal (time cost).")
     ap.add_argument("--skip-shap", action="store_true")
     ap.add_argument("--skip-gradcam", action="store_true")
+    ap.add_argument("--split-gradcam-panels", action="store_true",
+                    help="Also save the separate panel_A / panels_BC files alongside the combined one.")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--wandb", action="store_true",
+                    help="Upload every generated figure to Weights & Biases as it's saved.")
+    ap.add_argument("--project", type=str, default="ptbxl-ecg", help="W&B project name")
+    ap.add_argument("--entity", type=str, default=None, help="W&B entity (user or team)")
+    ap.add_argument("--run-name", type=str, default=None,
+                    help="W&B run name (default: <model>-figures)")
     args = ap.parse_args()
 
     seq_len = 5000 if args.sr == 500 else 1000
@@ -217,7 +210,8 @@ def main():
 
     # ---- checkpoint + model ----
     ckpt_dir = args.checkpoint_dir or str(config.LIGHTNING_LOGS_DIR / "checkpoints" / args.model)
-    ckpt = args.checkpoint or pick_best_val_loss_checkpoint(ckpt_dir)
+    class _A: checkpoint = args.checkpoint; checkpoint_dir = ckpt_dir
+    ckpt = pick_checkpoint(_A())  # the one checkpoint-selection function, from eval.py
     print(f"[figs] Checkpoint: {ckpt}")
     state = torch.load(ckpt, map_location="cpu", weights_only=True)
     sd = state["state_dict"] if "state_dict" in state else state
@@ -234,10 +228,59 @@ def main():
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     failures = []
 
-    def attempt(label, fn):
+    wandb_run = None
+    if args.wandb:
+        import wandb
+        wandb_run = wandb.init(
+            project=args.project, entity=args.entity,
+            name=args.run_name or f"{detected}-figures",
+            job_type="figures", config={"model": detected, "checkpoint": str(ckpt)},
+        )
+
+    def _to_png_bytes(path):
+        """PDF -> PNG bytes (first page) for W&B display. PNG files pass through untouched."""
+        path = str(path)
+        if path.endswith(".png"):
+            with open(path, "rb") as f:
+                return f.read()
         try:
-            fn()
+            import fitz  # PyMuPDF
+        except ImportError:
+            print(f"[figs]   [wandb] skipped {path}: PyMuPDF not installed "
+                  f"(pip install pymupdf) -- figure saved locally, just not uploaded")
+            return None
+        doc = fitz.open(path)
+        pix = doc[0].get_pixmap(dpi=150)
+        png_bytes = pix.tobytes("png")
+        doc.close()
+        return png_bytes
+
+    def log_figure(key, path):
+        """Uploads one saved figure to the current W&B run. No-op if --wandb wasn't passed."""
+        if wandb_run is None:
+            return
+        png_bytes = _to_png_bytes(path)
+        if png_bytes is None:
+            return
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(png_bytes))
+        wandb_run.log({key: wandb.Image(img, caption=str(path))})
+
+    def attempt(label, fn, wandb_key=None):
+        """
+        Runs fn(). If fn() returns a path (or list of paths) and --wandb is on,
+        each returned path gets uploaded under wandb_key (default: label, with
+        spaces -> "/" so e.g. "gradcam AFIB" logs as "gradcam/AFIB").
+        """
+        try:
+            result = fn()
             print(f"[figs]   ok: {label}")
+            if wandb_run is not None and result:
+                key = wandb_key or label.replace(" ", "/")
+                paths = result if isinstance(result, (list, tuple)) else [result]
+                for p in paths:
+                    log_figure(key, p)
         except Exception as e:
             failures.append((label, repr(e)))
             print(f"[figs]   FAILED: {label}: {e!r}")
@@ -257,8 +300,8 @@ def main():
                          threshold=thr[i], precision=p, recall=r, f2=f2))
     pd.DataFrame(rows).to_csv(config.RESULTS_DIR / f"f2_thresholds_{detected}.csv", index=False)
 
-    attempt("roc_curves", lambda: F.plot_roc(y_true, y_pred, TARGET_CLASSES, detected, out_dir / "roc_curves.png"))
-    attempt("confusion", lambda: F.plot_confusion_grid(y_true, y_pred, thr, TARGET_CLASSES, detected, out_dir / "confusion.pdf"))
+    attempt("roc_curves", lambda: (F.plot_roc(y_true, y_pred, TARGET_CLASSES, detected, out_dir / "roc_curves.png"), out_dir / "roc_curves.png")[-1])
+    attempt("confusion", lambda: (F.plot_confusion_grid(y_true, y_pred, thr, TARGET_CLASSES, detected, out_dir / "confusion.pdf"), out_dir / "confusion.pdf")[-1])
 
     # ---- capabilities ----
     target_layer = None if args.skip_gradcam else get_target_layer(model, detected)
@@ -284,8 +327,12 @@ def main():
         if gradcam_ok:
             def _gc():
                 mean_cam, all_cams = compute_mean_cam(model, pos_ct, ci, device, seq_len, target_layer)
-                F.plot_gradcam_panel_a(rep, mean_cam, cname, out_dir / f"gradcam_{lc}_panel_A.pdf", fs)
-                F.plot_gradcam_panels_bc(all_cams, rep, mean_cam, cname, out_dir / f"gradcam_{lc}_panels_BC.pdf", fs)
+                gc_path = out_dir / f"gradcam_{lc}.pdf"
+                F.plot_gradcam_combined(all_cams, rep, mean_cam, cname, gc_path, fs)
+                if args.split_gradcam_panels:
+                    F.plot_gradcam_panel_a(rep, mean_cam, cname, out_dir / f"gradcam_{lc}_panel_A.pdf", fs)
+                    F.plot_gradcam_panels_bc(all_cams, rep, mean_cam, cname, out_dir / f"gradcam_{lc}_panels_BC.pdf", fs)
+                return gc_path
             attempt(f"gradcam {cname}", _gc)
 
         if not args.skip_shap:
@@ -294,13 +341,15 @@ def main():
                 _, shap3d = compute_shap_for_class(
                     shap_model, device, sig_n, ci, n_background=args.n_shap_background,
                     n_explain=args.n_shap_explain, nsamples=args.shap_nsamples, signal_length=seq_len)
-                F.plot_shap_figure(cname, rep, shap3d, detected, out_dir / f"shap_{lc}.pdf", fs, args.shap_nsamples)
+                shap_path = out_dir / f"shap_{lc}.pdf"
+                F.plot_shap_figure(cname, rep, shap3d, detected, shap_path, fs, args.shap_nsamples)
+                return shap_path
             attempt(f"shap {cname}", _shap)
 
         if attention_ok:
-            attempt(f"attention {cname}", lambda: F.plot_attention_figure(
+            attempt(f"attention {cname}", lambda: (F.plot_attention_figure(
                 cname, rep, extract_attention_weights(model, rep, device), detected,
-                out_dir / f"attention_{lc}.pdf", fs))
+                out_dir / f"attention_{lc}.pdf", fs), out_dir / f"attention_{lc}.pdf")[-1])
 
         if gradcam_ok:
             def _bw():
@@ -312,11 +361,13 @@ def main():
                 b_i, b_conf, w_i, w_conf, w_label = pick
                 b_cam, b_limp = cam_bundle(model, sample_ct(val_ds, b_i), ci, device, target_layer)
                 w_cam, w_limp = cam_bundle(model, sample_ct(val_ds, w_i), ci, device, target_layer)
+                bw_path = out_dir / f"best_worst_{lc}.pdf"
                 F.plot_best_worst(
                     cname, detected,
                     dict(signal=sample_ct(val_ds, b_i), cam=b_cam, limp=b_limp, conf=b_conf),
                     dict(signal=sample_ct(val_ds, w_i), cam=w_cam, limp=w_limp, conf=w_conf),
-                    w_label, out_dir / f"best_worst_{lc}.pdf", fs)
+                    w_label, bw_path, fs)
+                return bw_path
             attempt(f"best_worst {cname}", _bw)
 
             def _neg():
@@ -327,8 +378,10 @@ def main():
                 t_i, t_conf = tn
                 sig = sample_ct(val_ds, t_i)
                 cam, limp = cam_bundle(model, sig, ci, device, target_layer, absolute=True)
+                neg_path = out_dir / f"negative_{lc}.pdf"
                 F.plot_negative_example(cname, detected, dict(signal=sig, cam=cam, limp=limp, conf=t_conf),
-                                        thr[ci], out_dir / f"negative_{lc}.pdf", fs)
+                                        thr[ci], neg_path, fs)
+                return neg_path
             attempt(f"negative {cname}", _neg)
 
     print(f"\n[figs] Done. Figures in {out_dir}")
@@ -338,6 +391,9 @@ def main():
         print(f"\n[figs] {len(failures)} figure(s) FAILED:")
         for label, err in failures:
             print(f"   - {label}: {err}")
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
