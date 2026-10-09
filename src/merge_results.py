@@ -47,6 +47,19 @@ def main():
 
     combined = pd.concat(rows, ignore_index=True)
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    rule_rows = []
+    for path in summary_files:
+        dir_name = os.path.basename(os.path.dirname(path))
+        model_name = infer_model_name(dir_name)
+        rp = os.path.join(os.path.dirname(path), "threshold_rules_test.csv")
+        if model_name != "last" and os.path.exists(rp):
+            r = pd.read_csv(rp)
+            r.insert(0, "model", model_name)
+            rule_rows.append(r)
+    if rule_rows:
+        pd.concat(rule_rows, ignore_index=True).to_csv(
+            config.RESULTS_DIR / "model_comparison_threshold_rules.csv", index=False)
     out_path = config.RESULTS_DIR / "model_comparison.csv"
     combined.to_csv(out_path, index=False)
 

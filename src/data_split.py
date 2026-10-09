@@ -1,33 +1,30 @@
 """
 data_split.py
 =============
-Generates the ONE patient-grouped train/val split for the project and
-saves it to disk. Every training/eval script should read this file
-instead of recomputing its own split.
+ONE shared train/val/test split for the whole project, using PTB-XL's OFFICIAL
+`strat_fold` column (Wagner et al. 2020; same protocol as Strodthoff et al. 2021):
 
-This matches EXACTLY the filtering + split logic already used in
-src/train_lightning.py (and now src/eval.py after the leakage fix):
-  - load ptbxl_database.csv
-  - parse scp_codes, filter to the 8 TARGET_CLASSES
-  - drop records with none of the target classes
-  - GroupShuffleSplit on patient_id, test_size=0.2, seed=42
+    folds 1-8 -> train      fold 9 -> validation      fold 10 -> test
 
-NOTE: the real codebase only ever used a single 80/20 train/val split
-(no separate held-out test set). This script reproduces that reality
-rather than inventing a 3-way split that doesn't match your other files.
+strat_fold is patient-grouped (no patient appears in two folds), label-stratified,
+and fixed in the dataset itself -- there is no random seed involved, so the split
+is identical for everyone and directly comparable with published PTB-XL results.
 
-Usage (run once, from the repo root, on the machine where the dataset lives):
+Usage (run once, from src/, on the machine where the dataset lives):
     python data_split.py
 """
 
 import ast
 import json
 
+import numpy as np
 import pandas as pd
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.preprocessing import MultiLabelBinarizer
 
 import config
+
+TRAIN_FOLDS = list(range(1, 9))   # 1..8
+VAL_FOLD = 9
+TEST_FOLD = 10
 
 
 def build_and_save_split():
@@ -35,62 +32,70 @@ def build_and_save_split():
     print(f"[data_split] Loading {csv_path}")
     df = pd.read_csv(csv_path)
 
-    # ---- identical filtering to train_lightning.py / eval.py ----
+    for col in ("strat_fold", "patient_id", "filename_lr"):
+        if col not in df.columns:
+            raise RuntimeError(f"'{col}' column not found in ptbxl_database.csv")
+
+    # ---- same label filtering as train_lightning.py / eval.py (confidence >= 50) ----
     df["scp_codes"] = df["scp_codes"].apply(ast.literal_eval)
-    # Confidence >= 50 rule, matching the notebook that actually produced the
-    # thesis's reported results.
-    df["scp_filtered"] = df["scp_codes"].apply(
-        lambda codes: [k for k, conf in codes.items() if k in config.CLASSES and conf >= 50]
-    )
+    df["scp_filtered"] = df["scp_codes"].apply(config.filter_codes)
+    n_all = len(df)
     df = df[df["scp_filtered"].map(len) > 0].reset_index(drop=True)
+    print(f"[data_split] {len(df)} / {n_all} records have >=1 of the 8 target classes (rhythm classes any conf, diagnostic >= 50)")
 
-    mlb = MultiLabelBinarizer(classes=config.CLASSES)
-    y = mlb.fit_transform(df["scp_filtered"])
-    # filename_lr (100Hz) matches the notebook's actual pipeline, NOT filename_hr (500Hz).
     records = df["filename_lr"].str.replace(".hea", "", regex=False).values
+    patients = df["patient_id"].values
+    folds = df["strat_fold"].values
 
-    if "patient_id" not in df.columns:
-        raise RuntimeError(
-            "patient_id column not found in ptbxl_database.csv — "
-            "cannot build a patient-grouped split."
-        )
+    masks = {
+        "train": np.isin(folds, TRAIN_FOLDS),
+        "val": folds == VAL_FOLD,
+        "test": folds == TEST_FOLD,
+    }
 
-    groups = df["patient_id"].values
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=config.SEED)
-    train_idx, val_idx = next(gss.split(records, y, groups=groups))
+    # ---- sanity checks ----
+    pats = {k: set(patients[m].tolist()) for k, m in masks.items()}
+    overlaps = {
+        "train&val": len(pats["train"] & pats["val"]),
+        "train&test": len(pats["train"] & pats["test"]),
+        "val&test": len(pats["val"] & pats["test"]),
+    }
+    assert all(v == 0 for v in overlaps.values()), f"Patient leakage across splits: {overlaps}"
 
-    train_records = records[train_idx].tolist()
-    val_records = records[val_idx].tolist()
-
-    train_patients = set(df.iloc[train_idx]["patient_id"].tolist())
-    val_patients = set(df.iloc[val_idx]["patient_id"].tolist())
-
-    overlap = train_patients & val_patients
-    assert not overlap, (
-        f"Patient leakage detected: {len(overlap)} patients appear in both splits."
-    )
+    # ---- per-class positive counts per split (the AFIB diagnostic) ----
+    print("\n[data_split] Positives per class (records):")
+    print(f"  {'class':<7}{'train':>8}{'val':>8}{'test':>8}")
+    for c in config.CLASSES:
+        has = df["scp_filtered"].apply(lambda L: c in L).values
+        print(f"  {c:<7}{int(has[masks['train']].sum()):>8}"
+              f"{int(has[masks['val']].sum()):>8}{int(has[masks['test']].sum()):>8}")
 
     split = {
-        "seed": config.SEED,
+        "method": "strat_fold",
+        "train_folds": TRAIN_FOLDS,
+        "val_fold": VAL_FOLD,
+        "test_fold": TEST_FOLD,
         "classes": config.CLASSES,
-        "train_records": train_records,
-        "val_records": val_records,
-        "num_train_patients": len(train_patients),
-        "num_val_patients": len(val_patients),
+        "train_records": records[masks["train"]].tolist(),
+        "val_records": records[masks["val"]].tolist(),
+        "test_records": records[masks["test"]].tolist(),
+        "num_train_patients": len(pats["train"]),
+        "num_val_patients": len(pats["val"]),
+        "num_test_patients": len(pats["test"]),
     }
 
     config.SPLIT_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(config.SPLIT_FILE, "w") as f:
         json.dump(split, f, indent=2)
 
-    print(f"[data_split] Saved -> {config.SPLIT_FILE}")
-    print(f"[data_split] train: {len(train_records)} records, {len(train_patients)} patients")
-    print(f"[data_split] val:   {len(val_records)} records, {len(val_patients)} patients")
-    print(f"[data_split] Patient overlap: {len(overlap)} (must be 0)")
+    print(f"\n[data_split] Saved -> {config.SPLIT_FILE}")
+    for k in ("train", "val", "test"):
+        print(f"[data_split] {k:<5}: {int(masks[k].sum())} records, {len(pats[k])} patients")
+    print(f"[data_split] Patient overlap: {overlaps} (all must be 0)")
 
 
 def load_split():
-    """Every training/eval script should call THIS instead of re-splitting."""
+    """Every training/eval script calls THIS instead of re-splitting."""
     with open(config.SPLIT_FILE) as f:
         return json.load(f)
 

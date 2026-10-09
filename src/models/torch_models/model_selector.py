@@ -5,6 +5,10 @@ def get_model(name, input_shape, num_classes, **kwargs):
         from .resnet1d import build_model
         return build_model(input_shape, num_classes, **kwargs)
 
+    elif name == "cnn1d":
+        from .cnn1d import build_model
+        return build_model(input_shape, num_classes, **kwargs)
+
     elif name == "xresnet1d":
         from .xresnet1d import build_model
         return build_model(input_shape, num_classes, **kwargs)

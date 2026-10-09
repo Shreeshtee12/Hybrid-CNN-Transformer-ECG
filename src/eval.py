@@ -41,6 +41,7 @@ from models.components.lit_generic import LitGenericModel
 from models.torch_models.model_selector import get_model
 
 import config
+import thresholds
 
 # Allowlist optimizer classes that may appear inside Lightning checkpoints when loading with weights_only
 add_safe_globals([torch.optim.AdamW])
@@ -206,9 +207,7 @@ def main():
     if ckpt_num_classes == len(TARGET_CLASSES):
         # 8-class evaluation. Confidence >= 50 rule, matching train_lightning.py
         # and the notebook that actually produced the thesis's reported results.
-        df["scp_filtered"] = df["scp_codes"].apply(
-            lambda codes: [k for k, conf in codes.items() if k in TARGET_CLASSES and conf >= 50]
-        )
+        df["scp_filtered"] = df["scp_codes"].apply(config.filter_codes)
         df = df[df["scp_filtered"].map(len) > 0].reset_index(drop=True)
         mlb = MultiLabelBinarizer(classes=TARGET_CLASSES)
         y = mlb.fit_transform(df["scp_filtered"])
@@ -241,10 +240,12 @@ def main():
         split = load_split()
         train_mask = np.isin(records, split["train_records"])
         val_mask = np.isin(records, split["val_records"])
+        test_mask = np.isin(records, split["test_records"])
         train_rec, y_train = records[train_mask], y[train_mask]
         val_rec, y_val = records[val_mask], y[val_mask]
-        print(f"[eval] Loaded shared split: {len(train_rec)} train / {len(val_rec)} val records "
-              f"(seed={split['seed']})")
+        test_rec, y_test = records[test_mask], y[test_mask]
+        print(f"[eval] Loaded shared split ({split['method']}): {len(train_rec)} train / "
+              f"{len(val_rec)} val (fold {split['val_fold']}) / {len(test_rec)} test (fold {split['test_fold']}) records")
     except FileNotFoundError:
         raise SystemExit(
             "No shared split found. Run `python data_split.py` once before evaluating "
@@ -253,10 +254,12 @@ def main():
 
     train_ds = PTBXL_Dataset(train_rec, y_train, args.signal_path, sr=args.sr)
     val_ds   = PTBXL_Dataset(val_rec,  y_val,   args.signal_path, sr=args.sr)
+    test_ds  = PTBXL_Dataset(test_rec, y_test,  args.signal_path, sr=args.sr)
 
     pin = torch.cuda.is_available()
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=pin)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=pin)
+    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=pin)
 
     # ---------- Build model ----------
     detected_model = infer_model_name_from_state(sd, args.model)
@@ -289,15 +292,17 @@ def main():
             ys.append(yb.numpy())
         return np.vstack(ps), np.vstack(ys)
 
-    # ---------- Validation metrics ----------
-    y_pred_all, y_true_all = infer(val_loader)
-    if not use_full_space and num_classes_for_model == len(TARGET_CLASSES):
-        y_pred, y_true = y_pred_all, y_true_all
-    else:
-        # project to the present target indices
+    # ---------- Predictions: validation (fit thresholds) and TEST (report) ----------
+    def _project(p_all, t_all):
+        if not use_full_space and num_classes_for_model == len(TARGET_CLASSES):
+            return p_all, t_all
         if target_idxs is None or len(target_idxs) == 0:
             raise ValueError("None of TARGET_CLASSES were present in the dataset when using full label space.")
-        y_pred, y_true = y_pred_all[:, target_idxs], y_true_all[:, target_idxs]
+        return p_all[:, target_idxs], t_all[:, target_idxs]
+
+    yv_pred, yv_true = _project(*infer(val_loader))     # fold 9: used ONLY to fit thresholds
+    y_pred, y_true = _project(*infer(test_loader))      # fold 10: everything reported below
+    print(f"[eval] Reporting on the held-out TEST fold: {len(y_true)} records")
 
     # ----- Create unique output directory per checkpoint -----
     base_out = args.output_dir
@@ -308,7 +313,7 @@ def main():
     # Console report @threshold
     thr = float(args.threshold)
     y_pred_bin = (y_pred >= thr).astype(int)
-    print("\nClassification Report (targets):")
+    print("\nClassification Report (TEST fold, fixed threshold):")
     print(classification_report(y_true, y_pred_bin, target_names=target_names,
                                 zero_division=0, digits=2))
 
@@ -417,6 +422,8 @@ def main():
 
     pd.DataFrame([
         {
+            "split": "test",
+            "macro_auroc": thresholds.macro_auroc(y_true, y_pred),
             "threshold": thr,
             "TN": overall_tn, "FP": overall_fp, "FN": overall_fn, "TP": overall_tp,
             "micro_precision": micro_prec,
@@ -427,6 +434,26 @@ def main():
             "jaccard_mean": jaccard_mean,
         }
     ]).to_csv(os.path.join(out_dir, "overall_summary.csv"), index=False)
+
+    # ---------- Three threshold rules: FIT on validation (fold 9), REPORT on test (fold 10) ----------
+    rule_rows, thr_rows = [], []
+    for rule in thresholds.RULES:
+        thr_vec = thresholds.get_thresholds(rule, yv_true, yv_pred)
+        per, macro, micro = thresholds.score_at(y_true, y_pred, thr_vec)
+        rule_rows.append({
+            "rule": rule, "split": "test",
+            **{f"macro_{k}": v for k, v in macro.items()},
+            **{f"micro_{k}": v for k, v in micro.items()},
+        })
+        for i, cls in enumerate(target_names):
+            thr_rows.append({"rule": rule, "class": cls, "threshold": float(thr_vec[i]),
+                             "n_pos_val": int(yv_true[:, i].sum()), "n_pos_test": int(y_true[:, i].sum()),
+                             **per[i]})
+    pd.DataFrame(rule_rows).to_csv(os.path.join(out_dir, "threshold_rules_test.csv"), index=False)
+    pd.DataFrame(thr_rows).to_csv(os.path.join(out_dir, "per_class_thresholds_test.csv"), index=False)
+    print("\nTEST-fold macro metrics by threshold rule (thresholds fit on validation fold):")
+    print(pd.DataFrame(rule_rows)[["rule", "macro_precision", "macro_recall", "macro_f1", "macro_f2"]]
+          .to_string(index=False, float_format=lambda v: f"{v:.3f}"))
 
     # ---------- ROC Plots ----------
     # ROC per label + per-class AUC table

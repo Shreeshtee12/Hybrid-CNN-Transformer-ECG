@@ -100,6 +100,18 @@ def build_comparison_table(eval_dirs: dict):
 
     combined = pd.concat(rows, ignore_index=True)
     os.makedirs("results", exist_ok=True)
+
+    # Second table: TEST-fold metrics under the three threshold rules (fit on validation)
+    rule_rows = []
+    for model_name, out_dir in eval_dirs.items():
+        rp = os.path.join(out_dir, "threshold_rules_test.csv")
+        if os.path.exists(rp):
+            r = pd.read_csv(rp)
+            r.insert(0, "model", model_name)
+            rule_rows.append(r)
+    if rule_rows:
+        pd.concat(rule_rows, ignore_index=True).to_csv(
+            os.path.join("results", "model_comparison_threshold_rules.csv"), index=False)
     out_path = os.path.join("results", "model_comparison.csv")
     combined.to_csv(out_path, index=False)
 

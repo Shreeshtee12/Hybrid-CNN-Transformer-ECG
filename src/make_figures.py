@@ -55,6 +55,7 @@ from sklearn.preprocessing import MultiLabelBinarizer
 from torch.utils.data import DataLoader
 
 import config
+import thresholds
 import ecg_figures as F
 from data_split import load_split
 from eval import (
@@ -191,22 +192,23 @@ def main():
     fs = args.sr
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("[figs] NOTE: thresholds are tuned AND reported on the validation set (no held-out "
-          "test split exists yet) -- optimistic; see docstring.")
+    print("[figs] Thresholds are FIT on validation fold 9; figures/metrics are on the held-out TEST fold 10.")
 
     # ---- data (identical to eval.py / run_interpretability.py) ----
     df = pd.read_csv(args.csv_path)
     df["scp_codes"] = df["scp_codes"].apply(ast.literal_eval)
-    df["scp_filtered"] = df["scp_codes"].apply(
-        lambda codes: [k for k, c in codes.items() if k in TARGET_CLASSES and c >= 50])
+    df["scp_filtered"] = df["scp_codes"].apply(config.filter_codes)
     df = df[df["scp_filtered"].map(len) > 0].reset_index(drop=True)
     y = MultiLabelBinarizer(classes=TARGET_CLASSES).fit_transform(df["scp_filtered"])
     records = df["filename_lr"].str.replace(".hea", "", regex=False).values
     split = load_split()
-    mask = np.isin(records, split["val_records"])
-    val_ds = PTBXL_Dataset(records[mask], y[mask], args.signal_path, sr=args.sr)
-    y_true = y[mask].astype(int)
-    print(f"[figs] {len(val_ds)} validation records")
+    vmask = np.isin(records, split["val_records"])
+    tmask = np.isin(records, split["test_records"])
+    fit_ds = PTBXL_Dataset(records[vmask], y[vmask], args.signal_path, sr=args.sr)   # fold 9: thresholds only
+    yv_true = y[vmask].astype(int)
+    val_ds = PTBXL_Dataset(records[tmask], y[tmask], args.signal_path, sr=args.sr)   # fold 10: TEST (name kept for the code below)
+    y_true = y[tmask].astype(int)
+    print(f"[figs] {len(fit_ds)} validation records (threshold fitting), {len(val_ds)} TEST records (reported)")
 
     # ---- checkpoint + model ----
     ckpt_dir = args.checkpoint_dir or str(config.LIGHTNING_LOGS_DIR / "checkpoints" / args.model)
@@ -287,16 +289,26 @@ def main():
             traceback.print_exc()
 
     # ---- predictions, thresholds, ROC, confusion ----
+    yv_pred = predict_all(lit_model, fit_ds, device, args.batch_size, args.num_workers)
     y_pred = predict_all(lit_model, val_ds, device, args.batch_size, args.num_workers)
-    np.savez(config.RESULTS_DIR / f"preds_{detected}.npz", y_true=y_true, y_pred=y_pred)
-    thr = F.optimal_f2_thresholds(y_true, y_pred)
+    np.savez(config.RESULTS_DIR / f"preds_{detected}.npz",
+             y_true=y_true, y_pred=y_pred, yv_true=yv_true, yv_pred=yv_pred)   # test + validation
+    thr = thresholds.get_thresholds("f2_opt", yv_true, yv_pred)   # fit on fold 9, applied to fold 10
+    _rule_rows = []
+    for _rule in thresholds.RULES:
+        _t = thresholds.get_thresholds(_rule, yv_true, yv_pred)
+        _, _mac, _mic = thresholds.score_at(y_true, y_pred, _t)
+        _rule_rows.append(dict(model=detected, rule=_rule,
+                               **{f"macro_{k}": v for k, v in _mac.items()},
+                               **{f"micro_{k}": v for k, v in _mic.items()}))
+    pd.DataFrame(_rule_rows).to_csv(config.RESULTS_DIR / f"threshold_rules_{detected}.csv", index=False)
     rows = []
     for i, c in enumerate(TARGET_CLASSES):
         yb = (y_pred[:, i] >= thr[i]).astype(int)
         p = precision_score(y_true[:, i], yb, zero_division=0)
         r = recall_score(y_true[:, i], yb, zero_division=0)
         f2 = 5 * p * r / (4 * p + r) if (4 * p + r) > 0 else 0.0
-        rows.append(dict(model=detected, cls=c, n_pos_val=int(y_true[:, i].sum()),
+        rows.append(dict(model=detected, cls=c, n_pos_test=int(y_true[:, i].sum()), n_pos_val=int(yv_true[:, i].sum()),
                          threshold=thr[i], precision=p, recall=r, f2=f2))
     pd.DataFrame(rows).to_csv(config.RESULTS_DIR / f"f2_thresholds_{detected}.csv", index=False)
 
@@ -355,7 +367,7 @@ def main():
         print(f"\n[figs] === {cname} ===")
         pos = collect_class_samples(val_ds, ci, args.n_gradcam_samples, positive=True)
         if len(pos) == 0:
-            print(f"[figs]   no positive validation samples, skipping {cname}")
+            print(f"[figs]   no positive test samples, skipping {cname}")
             continue
         pos_ct = to_chw(pos, seq_len)
         rep = pos_ct[0]

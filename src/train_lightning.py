@@ -160,9 +160,7 @@ def main():
     # thesis's reported results -- a code present with low confidence does NOT
     # count as a positive label here (this repo's OTHER pipeline ignored
     # confidence entirely, which is a real difference in label quality).
-    df['scp_filtered'] = df['scp_codes'].apply(
-        lambda codes: [k for k, conf in codes.items() if k in TARGET_CLASSES and conf >= 50]
-    )
+    df['scp_filtered'] = df['scp_codes'].apply(config.filter_codes)
     df = df[df['scp_filtered'].map(len) > 0].reset_index(drop=True)
 
     mlb = MultiLabelBinarizer(classes=TARGET_CLASSES)
@@ -182,7 +180,7 @@ def main():
         train_rec, y_train = records_all[train_mask], y_all[train_mask]
         val_rec, y_val = records_all[val_mask], y_all[val_mask]
         print(f"[train] Loaded shared split: {len(train_rec)} train / {len(val_rec)} val records "
-              f"(seed={split['seed']})")
+              f"(method={split['method']})")
     except FileNotFoundError:
         raise SystemExit(
             "No shared split found. Run `python data_split.py` once before training "

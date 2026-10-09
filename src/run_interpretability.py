@@ -77,6 +77,8 @@ def get_target_layer(model, model_name):
     """
     if model_name == "cnn_transformer":
         return model.cnn4
+    elif model_name == "cnn1d":
+        return model.blocks[-1]
     elif model_name == "resnet1d":
         return model.layer4
     elif model_name == "xresnet1d":
@@ -134,9 +136,7 @@ def main():
     # ---------- Load data (identical to eval.py) ----------
     df = pd.read_csv(args.csv_path)
     df["scp_codes"] = df["scp_codes"].apply(ast.literal_eval)
-    df["scp_filtered"] = df["scp_codes"].apply(
-        lambda codes: [k for k, conf in codes.items() if k in TARGET_CLASSES and conf >= 50]
-    )
+    df["scp_filtered"] = df["scp_codes"].apply(config.filter_codes)
     df = df[df["scp_filtered"].map(len) > 0].reset_index(drop=True)
 
     mlb = MultiLabelBinarizer(classes=TARGET_CLASSES)
@@ -144,10 +144,11 @@ def main():
     records = df["filename_lr"].str.replace(".hea", "", regex=False).values
 
     split = load_split()
-    val_mask = np.isin(records, split["val_records"])
-    val_rec, y_val = records[val_mask], y[val_mask]
-    val_dataset = PTBXL_Dataset(val_rec, y_val, args.signal_path, sr=args.sr)
-    print(f"[interp] Loaded {len(val_dataset)} validation records")
+    # Interpretability is computed on the held-out TEST fold (10).
+    test_mask = np.isin(records, split["test_records"])
+    test_rec, y_test = records[test_mask], y[test_mask]
+    val_dataset = PTBXL_Dataset(test_rec, y_test, args.signal_path, sr=args.sr)
+    print(f"[interp] Loaded {len(val_dataset)} TEST records (strat_fold 10)")
 
     # ---------- Load checkpoint (identical approach to eval.py) ----------
     ckpt_path = pick_checkpoint(args)
@@ -177,7 +178,7 @@ def main():
         print(f"\n[interp] === {class_name} ===")
         pos_signals = collect_class_samples(val_dataset, class_idx, args.n_gradcam_samples, positive=True)
         if len(pos_signals) == 0:
-            print(f"[interp] No positive validation samples for {class_name}, skipping.")
+            print(f"[interp] No positive test samples for {class_name}, skipping.")
             continue
         print(f"[interp] {len(pos_signals)} positive samples found")
         pos_chw = to_chw(pos_signals, args.seq_len)
@@ -207,7 +208,7 @@ def main():
                 row["n_negative_samples"] = len(neg_signals)
                 row["gradcam_pos_vs_neg_attention_corr"] = float(pos_neg_corr)
             else:
-                print(f"[interp] No negative validation samples for {class_name} (unusual).")
+                print(f"[interp] No negative test samples for {class_name} (unusual).")
                 row["n_negative_samples"] = 0
                 row["gradcam_pos_vs_neg_attention_corr"] = None
 
