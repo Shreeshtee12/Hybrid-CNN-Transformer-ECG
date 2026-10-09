@@ -22,7 +22,7 @@ import pandas as pd
 import config
 import ecg_figures as F
 
-ORDER = ["cnn1d", "cnn_transformer", "resnet1d", "xresnet1d", "transformer", "xlstm"]
+ORDER = ["cnn1d", "cnn_transformer", "resnet1d", "xresnet1d", "transformer", "cnn_bilstm"]
 
 
 def main():

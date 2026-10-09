@@ -21,8 +21,8 @@ def get_model(name, input_shape, num_classes, **kwargs):
         from .cnn_transformer import build_model
         return build_model(input_shape, num_classes, **kwargs)
 
-    elif name == "xlstm":
-        from .xlstm import build_model
+    elif name == "cnn_bilstm":
+        from .cnn_bilstm import build_model
         return build_model(input_shape, num_classes, **kwargs)
 
     else:

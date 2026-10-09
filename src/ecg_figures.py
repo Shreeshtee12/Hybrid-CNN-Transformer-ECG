@@ -51,7 +51,8 @@ MODEL_DISPLAY = {
     "resnet1d": "ResNet1D",
     "xresnet1d": "xResNet1D",
     "transformer": "Transformer",
-    "xlstm": "xLSTM",
+    "cnn1d": "1D CNN",
+    "cnn_bilstm": "CNN-BiLSTM",
 }
 
 

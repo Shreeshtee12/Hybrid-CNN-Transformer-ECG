@@ -15,7 +15,7 @@ whatever its accuracy says. This generalizes the notebook's one-off
 true-negative check (which it only ever did for a couple of classes by hand).
 
 Grad-CAM's hook target is architecture-specific (see get_target_layer below).
-It's supported for cnn_transformer, resnet1d, xresnet1d, and xlstm (the last
+It's supported for cnn_transformer, resnet1d, xresnet1d, and cnn_bilstm (the last
 with a caveat: it only explains the CNN front-end, not the LSTM's own
 temporal reasoning). It does NOT apply to the plain transformer model, which
 has no conv layer at all -- SHAP still runs for it, just without a Grad-CAM
@@ -69,7 +69,7 @@ def get_target_layer(model, model_name):
     - xresnet1d's index (-4) assumes the default layers=[2,2,2,2] config
       (stem=2 items, head=3 items -- the last ResBlock sits 4 from the end).
       If that config ever changes, this index needs updating too.
-    - xlstm only explains the CNN front-end (conv2), not what the LSTM
+    - cnn_bilstm only explains the CNN front-end (conv2), not what the LSTM
       itself attends to over time -- a genuine limitation, not a bug.
     - transformer has no conv layer at all; Grad-CAM as implemented here
       cannot apply. Would need attention-weight visualization instead,
@@ -83,7 +83,7 @@ def get_target_layer(model, model_name):
         return model.layer4
     elif model_name == "xresnet1d":
         return model[-4]
-    elif model_name == "xlstm":
+    elif model_name == "cnn_bilstm":
         return model.conv2
     elif model_name == "transformer":
         return None

@@ -1,9 +1,13 @@
-# models/xlstm.py
+# models/cnn_bilstm.py
+#
+# CNN front-end + standard bidirectional LSTM (CNN-BiLSTM).
+# NOTE: this is NOT the xLSTM of Beck et al. (2024) (no sLSTM/mLSTM blocks). It was called
+# "xLSTM" in the thesis; renamed here to match what it actually is.
 
 import torch
 import torch.nn as nn
 
-class xLSTMECG(nn.Module):
+class CNNBiLSTM(nn.Module):
     def __init__(self, input_channels=12, num_classes=10, hidden_size=128, num_layers=2):
         super().__init__()
         self.conv1 = nn.Conv1d(input_channels, 32, kernel_size=7, padding=3)
@@ -41,7 +45,7 @@ def build_model(input_shape, num_classes, hidden_size=128, num_layers=2, **kwarg
         num_layers (int): number of LSTM layers
     """
     input_channels, _ = input_shape
-    return xLSTMECG(input_channels=input_channels,
+    return CNNBiLSTM(input_channels=input_channels,
                     num_classes=num_classes,
                     hidden_size=hidden_size,
                     num_layers=num_layers)
